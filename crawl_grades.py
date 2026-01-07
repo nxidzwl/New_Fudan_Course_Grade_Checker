@@ -253,13 +253,13 @@ def crawl_grades():
             raise Exception(f"[-] Failed to detect grade sheet ID. Final URL was: {res_detect.url}")
         else:
             grade_sheet_id = match_id.group(1)
-            # print(f"[+] Detected grade sheet ID: {grade_sheet_id}")
+            print(f"[+] Detected grade sheet ID")
     except Exception as e:
         raise Exception(f"[-] Error detecting grade sheet ID: {e}")
 
     # Step 8: Fetch grades from API
     grade_api = f"https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/info/{grade_sheet_id}"
-    print(f"[*] Fetching all grades from {grade_api}...")
+    print(f"[*] Fetching all grades...")
     try:
         res_grades = session.get(grade_api)
         if res_grades.status_code == 200:
