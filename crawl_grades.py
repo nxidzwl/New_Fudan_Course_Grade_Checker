@@ -6,6 +6,8 @@ import time
 import json
 import base64
 import smtplib
+import html
+from urllib.parse import parse_qs, quote, urljoin, urlparse, unquote
 from email.mime.text import MIMEText
 from email.header import Header
 from Crypto.PublicKey import RSA
@@ -37,6 +39,146 @@ Features:
 GRADES_FILE = "grades_encrypted.json"
 SMTP_SERVER = 'smtp.qq.com'
 SMTP_PORT = 465 # SSL port for QQ SMTP
+
+
+def _redact_auth_params(text):
+    """Redact transient authentication parameters before logging URLs/snippets."""
+    if not text:
+        return ""
+    return re.sub(r"(?i)(lck|loginToken|ticket|SAMLRequest|SAMLResponse)=([^&#\s\"']+)", r"\1=***", text)
+
+
+def _query_keys_from_url(url):
+    parsed = urlparse(url)
+    keys = set(parse_qs(parsed.query, keep_blank_values=True).keys())
+    if parsed.fragment:
+        fragment_query = parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else parsed.fragment
+        keys.update(parse_qs(fragment_query, keep_blank_values=True).keys())
+    return sorted(keys)
+
+
+def _summarize_url(url):
+    if not url:
+        return ""
+    url = html.unescape(url)
+    parsed = urlparse(url)
+    query_keys = ",".join(_query_keys_from_url(url)) or "-"
+    fragment_path = parsed.fragment.split("?", 1)[0] if parsed.fragment else ""
+    fragment_desc = f"#{fragment_path}" if fragment_path else ""
+    return f"{parsed.scheme}://{parsed.netloc}{parsed.path}{fragment_desc} [query_keys={query_keys}]"
+
+
+def _extract_auth_params_from_url(url):
+    if not url:
+        return None, None
+
+    url = html.unescape(url)
+    parsed = urlparse(url)
+    query_strings = [parsed.query]
+    if parsed.fragment:
+        query_strings.append(parsed.fragment.split("?", 1)[1] if "?" in parsed.fragment else parsed.fragment)
+
+    for query_string in query_strings:
+        query = parse_qs(query_string, keep_blank_values=True)
+        lck = query.get("lck", [None])[0]
+        entity_id = query.get("entityId", [None])[0]
+        if lck and entity_id:
+            return lck, unquote(entity_id)
+
+    match_lck = re.search(r"(?:[?&#]|^)lck=([^&#]+)", url)
+    match_entity_id = re.search(r"(?:[?&#]|^)entityId=([^&#]+)", url)
+    if match_lck and match_entity_id:
+        return match_lck.group(1), unquote(match_entity_id.group(1))
+
+    return None, None
+
+
+def _extract_auth_params_from_response(response):
+    candidate_urls = []
+    for redirect_response in response.history:
+        candidate_urls.append(redirect_response.url)
+        location = redirect_response.headers.get("Location")
+        if location:
+            candidate_urls.append(location)
+            candidate_urls.append(urljoin(redirect_response.url, location))
+    candidate_urls.append(response.url)
+
+    for candidate_url in candidate_urls:
+        lck, entity_id = _extract_auth_params_from_url(candidate_url)
+        if lck and entity_id:
+            return lck, entity_id
+
+    page_text = html.unescape(response.text or "")
+    match_lck = re.search(r"(?:[?&#]|^)lck=([^&#\"'\s]+)", page_text)
+    match_entity_id = re.search(r"(?:[?&#]|^)entityId=([^&#\"'\s]+)", page_text)
+    if match_lck and match_entity_id:
+        return match_lck.group(1), unquote(match_entity_id.group(1))
+
+    return None, None
+
+
+def _format_redirect_diagnostics(response):
+    lines = ["[-] Redirect diagnostics:"]
+    chain = list(response.history) + [response]
+    for index, item in enumerate(chain):
+        line = f"    {index}. status={item.status_code} url={_summarize_url(item.url)}"
+        location = item.headers.get("Location")
+        if location:
+            line += f" location={_summarize_url(urljoin(item.url, location))}"
+        lines.append(line)
+
+    content_type = response.headers.get("Content-Type", "")
+    body_head = re.sub(r"\s+", " ", response.text[:300]).strip() if response.text else ""
+    if body_head:
+        lines.append(f"    final_content_type={content_type}")
+        lines.append(f"    final_body_head={_redact_auth_params(body_head)}")
+    return "\n".join(lines)
+
+
+def _extract_client_redirect_url(response):
+    page_text = html.unescape(response.text or "")
+    patterns = [
+        r'var\s+locationValue\s*=\s*["\']([^"\']+)["\']',
+        r'(?:window\.)?location(?:\.href)?\s*=\s*["\']([^"\']+)["\']',
+        r'(?:window\.)?location\.replace\(\s*["\']([^"\']+)["\']\s*\)',
+        r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\'][^"\']*url=([^"\']+)["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_text, flags=re.IGNORECASE)
+        if match:
+            return urljoin(response.url, match.group(1).replace("&amp;", "&"))
+    return None
+
+
+def _follow_client_redirects(session, response, max_hops=3):
+    for _ in range(max_hops):
+        next_url = _extract_client_redirect_url(response)
+        if not next_url:
+            break
+        response = session.get(next_url, allow_redirects=True, timeout=30)
+    return response
+
+
+def _extract_grade_sheet_id(response):
+    candidates = [response.url, html.unescape(response.text or "")]
+    patterns = [
+        r"semester-index/(\d+)",
+        r"grade/sheet/info/(\d+)",
+        r"gradeSheetId[\"'\s:=]+(\d+)",
+    ]
+    for candidate in candidates:
+        for pattern in patterns:
+            match = re.search(pattern, candidate)
+            if match:
+                return match.group(1)
+    return None
+
+
+def _build_uis_bootstrap_url():
+    target_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
+    service_url = f"https://fdjwgl.fudan.edu.cn/student/sso/login?refer={target_url}"
+    return f"https://id.fudan.edu.cn/idp/authCenter/authenticate?service={quote(service_url, safe='')}"
+
 
 def get_encryption_key():
     """Generates a Fernet key from 4 environment variables to prevent collision."""
@@ -155,23 +297,26 @@ def crawl_grades():
     target_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
     print(f"[*] Accessing {target_url}...")
     try:
-        res = session.get(target_url, allow_redirects=True)
+        res = session.get(target_url, allow_redirects=True, timeout=30)
     except Exception as e:
         raise Exception(f"[-] Network error: {e}")
     
-    # Extract lck and entityId from the UIS login URL
-    lck = None
-    match_lck = re.search(r'lck=([^&]+)', res.url)
-    if match_lck:
-        lck = match_lck.group(1)
-    
-    entityId = None
-    match_eid = re.search(r'entityId=([^&]+)', res.url)
-    if match_eid:
-        entityId = requests.utils.unquote(match_eid.group(1))
+    # Extract lck and entityId from the UIS redirect chain. On some runners,
+    # requests may drop the URL fragment from res.url, so inspect Location too.
+    lck, entityId = _extract_auth_params_from_response(res)
 
     if not lck or not entityId:
-        raise Exception("[-] Failed to get authentication parameters from redirect URL.")
+        print("[*] Target page did not redirect to UIS. Trying direct UIS bootstrap...")
+        print(_format_redirect_diagnostics(res))
+        try:
+            res_bootstrap = session.get(_build_uis_bootstrap_url(), allow_redirects=True, timeout=30)
+        except Exception as e:
+            raise Exception(f"[-] UIS bootstrap network error: {e}")
+        lck, entityId = _extract_auth_params_from_response(res_bootstrap)
+
+        if not lck or not entityId:
+            print(_format_redirect_diagnostics(res_bootstrap))
+            raise Exception("[-] Failed to get authentication parameters from redirect URL.")
 
     # Step 2: Query authentication methods to get authChainCode
     print("[*] Querying authentication methods...")
@@ -235,8 +380,9 @@ def crawl_grades():
         
         redirect_url = match_loc.group(1).replace('&amp;', '&')
         # Visit the redirect URL to set cookies for the student system
-        res_final = session.get(redirect_url, allow_redirects=True)
-        print(f"[+] Login final redirection: {res_final.url}")
+        res_final = session.get(redirect_url, allow_redirects=True, timeout=30)
+        res_final = _follow_client_redirects(session, res_final)
+        print(f"[+] Login final redirection: {_summarize_url(res_final.url)}")
     except Exception as e:
         raise Exception(f"[-] Session finalization failed: {e}")
 
@@ -247,12 +393,13 @@ def crawl_grades():
     grade_base_url = "https://fdjwgl.fudan.edu.cn/student/for-std/grade/sheet/"
     print("[*] Detecting student grade sheet ID...")
     try:
-        res_detect = session.get(grade_base_url, allow_redirects=True)
-        match_id = re.search(r'semester-index/(\d+)', res_detect.url)
-        if not match_id:
-            raise Exception(f"[-] Failed to detect grade sheet ID. Final URL was: {res_detect.url}")
+        res_detect = session.get(grade_base_url, allow_redirects=True, timeout=30)
+        res_detect = _follow_client_redirects(session, res_detect)
+        grade_sheet_id = _extract_grade_sheet_id(res_detect)
+        if not grade_sheet_id:
+            print(_format_redirect_diagnostics(res_detect))
+            raise Exception(f"[-] Failed to detect grade sheet ID. Final URL was: {_summarize_url(res_detect.url)}")
         else:
-            grade_sheet_id = match_id.group(1)
             print(f"[+] Detected grade sheet ID")
     except Exception as e:
         raise Exception(f"[-] Error detecting grade sheet ID: {e}")

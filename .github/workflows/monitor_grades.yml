@@ -8,16 +8,22 @@ on:
 
 jobs:
   monitor-grades:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ACTIONS_RUNNER_LABEL || 'ubuntu-latest' }}
+    env:
+      GIT_CONFIG_COUNT: 2
+      GIT_CONFIG_KEY_0: http.proxy
+      GIT_CONFIG_VALUE_0: ""
+      GIT_CONFIG_KEY_1: https.proxy
+      GIT_CONFIG_VALUE_1: ""
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
-        python-version: '3.x'
+        python-version: '3.12'
 
     - name: Install dependencies
       run: |
